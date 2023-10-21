@@ -1,8 +1,10 @@
 import numpy as np
 import gymnasium as gym
 
+import numbers
 from queue import Queue
 from threading import Thread
+from collections import namedtuple
 
 import plotly
 import plotly.subplots
@@ -12,16 +14,22 @@ from dash import Dash, dcc, html, Input, Output, callback
 
 
 def dash_worker(msg_queue: Queue):
-    fig = go.Figure()
+    # fig = go.Figure()
     app = Dash(__name__)
     app.layout = html.Div([
         html.H4('Train RL'),
         dcc.Graph(id='rl-graph'),
         dcc.Interval(id='interval-component', interval=1*1000, n_intervals=0),
-        dcc.Graph(figure=fig)
+        # dcc.Graph(figure=fig)
     ])
 
-    data = {
+    train_data = {
+        'episode': [],
+        'total_reward': [],
+        'steps': [],
+    }
+
+    eval_data = {
         'episode': [],
         'total_reward': [],
         'steps': [],
@@ -29,7 +37,9 @@ def dash_worker(msg_queue: Queue):
 
     @callback(Output('rl-graph', 'figure'), Input('interval-component', 'n_intervals'))
     def update_rl_graph(n):
-        episode, values = msg_queue.get()
+        episode, value_type, values = msg_queue.get()
+
+        data = eval_data if value_type == 'eval' else train_data
 
         if not data['episode'] or data['episode'][-1] < episode:
             data['episode'].append(episode)
@@ -41,43 +51,77 @@ def dash_worker(msg_queue: Queue):
         else:
             print(f'skipped update for episode {episode}')
 
-        fig = plotly.subplots.make_subplots(rows=2, cols=1, vertical_spacing=0.2)
+        fig = plotly.subplots.make_subplots(rows=4, cols=1, vertical_spacing=0.2)
         fig.append_trace({
-            'x': data['episode'],
-            'y': data['total_reward'],
-            'name': 'Total Reward',
+            'x': eval_data['episode'],
+            'y': eval_data['total_reward'],
+            'name': 'Total Reward (eval)',
             'mode': 'lines+markers',
             'type': 'scatter'
         }, 1, 1)
         fig.append_trace({
-            'x': data['episode'],
-            'y': data['steps'],
-            'name': 'Steps',
+            'x': eval_data['episode'],
+            'y': eval_data['steps'],
+            'name': 'Steps (eval)',
             'mode': 'lines+markers',
             'type': 'scatter'
         }, 2, 1)
+
+        fig.append_trace({
+            'x': train_data['episode'],
+            'y': train_data['total_reward'],
+            'name': 'Total Reward (train)',
+            'mode': 'lines+markers',
+            'type': 'scatter'
+        }, 3, 1)
+        fig.append_trace({
+            'x': train_data['episode'],
+            'y': train_data['steps'],
+            'name': 'Steps (train)',
+            'mode': 'lines+markers',
+            'type': 'scatter'
+        }, 4, 1)
 
         return fig
 
     app.run_server(debug=True, use_reloader=False)
 
 
+Transition = namedtuple(
+    'Transition',
+    ['obs', 'action', 'new_obs', 'reward', 'terminated', 'truncated']
+)
+
+
 def train(agent, env, episodes, seed):
     for episode_idx in range(episodes):
+        episode = episode_idx + 1
         obs, info = env.reset(seed=seed)
+        policy = agent.explore(episode)
 
         terminated, truncated = False, False
-        step_idx = 0
+        total_reward = 0.0
+        steps = 0
+
         while not (terminated or truncated):
-            action = agent.explore(obs)
+            action = policy(obs)
             new_obs, reward, terminated, truncated, info = env.step(action)
+            trans = Transition(obs, action, new_obs, reward, terminated, truncated)
 
             # inform agent about the reward
-            agent.inform(obs, action, new_obs, reward, terminated, truncated)
+            agent.receive(episode, trans)
             obs = new_obs
-            step_idx += 1
+            total_reward += reward
+            steps += 1
 
-        yield episode_idx
+        yield (
+            episode,
+            {
+                'total_reward': total_reward,
+                'steps': steps,
+                'policy': policy.stats()
+            },
+        )
 
 
 def evaluate(agent, env, episodes, seed=None):
@@ -110,7 +154,44 @@ def episode_mean(episode_iter):
         yield episode, mean_values
 
 
+def constant_episode_fn(value):
+    def fn(episode):
+        return value
+    return fn
+
+
+def _ensure_float_callable(name, value, min_value, max_value):
+    if callable(value):
+        return value
+
+    if isinstance(value, float):
+        if not (min_value < value <= max_value):
+            raise ValueError(
+                f'{name} needs to be in ({min_value}, {max_value}]'
+            )
+        return constant_episode_fn(value)
+
+    raise ValueError(f'{name} neither float nor callable')
+
+
+class EpsilonGreedyPolicy:
+
+    def __init__(self, agent, epsilon):
+        self.agent = agent
+        self.epsilon = epsilon
+
+    def __call__(self, observation):
+        p = self.agent.rand.uniform(0, 1)
+        if p < self.epsilon:
+            return self.agent.action_space.sample()
+        return self.agent.action(observation)
+
+    def stats(self):
+        return {'epsilon': self.epsilon}
+
+
 class QLAgent:
+    """ Q-Learning agent."""
 
     def __init__(
         self,
@@ -123,28 +204,36 @@ class QLAgent:
     ):
         self.action_space = action_space
         self.observation_space = observation_space
-        self.qtable = np.zeros((observation_space.n, action_space.n))
-        self.learning_rate = learning_rate
         self.discount = discount
-        self.greedyness = greedyness
+        self.learning_rate = learning_rate
+        self.greedyness = _ensure_float_callable('greedyness', greedyness, 0, 1)
+
         self.rand = np.random.default_rng(seed)
+
+        # agents state
+        # self.qtable = np.zeros((observation_space.n, action_space.n))
+        self.qtable = self.rand.uniform(0, 1, (observation_space.n, action_space.n))
 
     def action(self, observation):
         return np.argmax(self.qtable[observation, :])
 
-    def explore(self, observation):
-        p = self.rand.uniform(0, 1)
-        if p < self.greedyness:
-            return self.action_space.sample()
-        return self.action(observation)
+    def explore(self, episode):
+        return EpsilonGreedyPolicy(self, self.greedyness(episode))
 
-    def inform(self, obs, action, new_obs, reward, terminated, truncated):
-        if terminated:
-            target = reward
+    def receive(self, episode, transition):
+        if transition.terminated:
+            target = transition.reward
         else:
-            target = reward + self.discount * np.max(self.qtable[new_obs, :])
-        q_value = self.qtable[obs, action]
-        self.qtable[obs, action] = (1 - self.learning_rate) * q_value + self.learning_rate * target
+            target = (
+                transition.reward
+                + self.discount * np.max(self.qtable[transition.new_obs, :])
+            )
+
+        q_value = self.qtable[transition.obs, transition.action]
+
+        self.qtable[transition.obs, transition.action] = (
+            (1 - self.learning_rate) * q_value + self.learning_rate * target
+        )
 
 
 if __name__ == '__main__':
@@ -163,18 +252,20 @@ if __name__ == '__main__':
 
     try:
         agent = QLAgent(
-            learning_rate=0.9,
-            discount=0.99,
+            learning_rate=0.7,
+            discount=0.95,
             greedyness=0.4,
             action_space=env.action_space,
             observation_space=env.observation_space
         )
 
-        for episode_idx in train(agent, env, 10000, seed=1889):
-            if episode_idx % 10 == 0:
+        for episode, values in train(agent, env, 10000, seed=1889):
+            msg_queue.put((episode+1, 'train', values))
+            if episode % 50 == 0:
                 # mean steps
-                for eval_episode, values in episode_mean(evaluate(agent, env, 10)):
-                    msg_queue.put((episode_idx+1, values))
+                for eval_episode, eval_values in episode_mean(evaluate(agent, env, 20)):
+                    msg_queue.put((episode+1, 'eval', eval_values))
+                # msg_queue.put(episode+1, {'policy': })
 
     finally:
         env.close()
